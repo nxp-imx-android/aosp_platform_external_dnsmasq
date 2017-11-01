@@ -320,7 +320,6 @@ static int create_ipv6_listener(struct listener **link, int port)
   l = safe_malloc(sizeof(struct listener));
   l->fd = fd;
   l->tcpfd = tcpfd;
-  l->tftpfd = -1;
   l->family = AF_INET6;
   l->iface = NULL;
   l->next = NULL;
@@ -335,7 +334,7 @@ struct listener *create_wildcard_listeners(void)
   union mysockaddr addr;
   int opt = 1;
   struct listener *l, *l6 = NULL;
-  int tcpfd = -1, fd = -1, tftpfd = -1;
+  int tcpfd = -1, fd = -1;
 
   memset(&addr, 0, sizeof(addr));
   addr.in.sin_family = AF_INET;
@@ -369,32 +368,29 @@ struct listener *create_wildcard_listeners(void)
 #endif 
 	  bind(fd, (struct sockaddr *)&addr, sa_len(&addr)) == -1)
 	return NULL;
-    }
-  
-#ifdef HAVE_TFTP
-  if (daemon->options & OPT_TFTP)
-    {
-      addr.in.sin_port = htons(TFTP_PORT);
-      if ((tftpfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
+
+#ifdef __ANDROID__
+      uint32_t mark = daemon->listen_mark;
+      if (mark != 0 &&
+	  (setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) == -1 ||
+	   setsockopt(tcpfd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) == -1 ||
+	   setsockopt(l6->fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) == -1 ||
+	   setsockopt(l6->tcpfd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) == -1))
+      {
+	my_syslog(LOG_WARNING, _("setsockopt(SO_MARK, 0x%x: %s"), mark, strerror(errno));
+	close(fd);
+	close(tcpfd);
+	close(l6->fd);
+	close(l6->tcpfd);
 	return NULL;
-      
-      if (!fix_fd(tftpfd) ||
-#if defined(HAVE_LINUX_NETWORK) 
-	  setsockopt(tftpfd, SOL_IP, IP_PKTINFO, &opt, sizeof(opt)) == -1 ||
-#elif defined(IP_RECVDSTADDR) && defined(IP_RECVIF)
-	  setsockopt(tftpfd, IPPROTO_IP, IP_RECVDSTADDR, &opt, sizeof(opt)) == -1 ||
-	  setsockopt(tftpfd, IPPROTO_IP, IP_RECVIF, &opt, sizeof(opt)) == -1 ||
-#endif 
-	  bind(tftpfd, (struct sockaddr *)&addr, sa_len(&addr)) == -1)
-	return NULL;
+      }
     }
-#endif
-  
+#endif /* __ANDROID__ */
+
   l = safe_malloc(sizeof(struct listener));
   l->family = AF_INET;
   l->fd = fd;
   l->tcpfd = tcpfd;
-  l->tftpfd = tftpfd;
   l->iface = NULL;
   l->next = l6;
 
@@ -425,7 +421,6 @@ void create_bound_listener(struct listener **listeners, struct irec *iface)
   new->family = iface->addr.sa.sa_family;
   new->iface = iface;
   new->next = *listeners;
-  new->tftpfd = -1;
   new->tcpfd = -1;
   new->fd = -1;
   *listeners = new;
@@ -476,23 +471,15 @@ void create_bound_listener(struct listener **listeners, struct irec *iface)
       die(_("failed to bind listening socket for %s: %s"), daemon->namebuff, EC_BADNET);
     }
 
+    uint32_t mark = daemon->listen_mark;
+    if (mark != 0 &&
+	(setsockopt(new->fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) == -1 ||
+	 setsockopt(new->tcpfd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) == -1))
+      die(_("failed to set SO_MARK on listen socket: %s"), NULL, EC_BADNET);
+
     if (listen(new->tcpfd, 5) == -1)
       die(_("failed to listen on socket: %s"), NULL, EC_BADNET);
   }
-
-#ifdef HAVE_TFTP
-  if ((daemon->options & OPT_TFTP) && iface->addr.sa.sa_family == AF_INET && iface->dhcp_ok)
-  {
-    short save = iface->addr.in.sin_port;
-    iface->addr.in.sin_port = htons(TFTP_PORT);
-    if ((new->tftpfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1 ||
-        setsockopt(new->tftpfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1 ||
-        !fix_fd(new->tftpfd) ||
-        bind(new->tftpfd, &iface->addr.sa, sa_len(&iface->addr)) == -1)
-      die(_("failed to create TFTP socket: %s"), NULL, EC_BADNET);
-    iface->addr.in.sin_port = save;
-  }
-#endif
 }
 
 /**
@@ -536,11 +523,6 @@ int delete_listener(struct listener **l)
     my_syslog(LOG_INFO, _("Closing wildcard listener family=%d"), listener->family);
   }
 
-  if (listener->tftpfd != -1)
-  {
-    close(listener->tftpfd);
-    listener->tftpfd = -1;
-  }
   if (listener->tcpfd != -1)
   {
     close(listener->tcpfd);
@@ -610,7 +592,6 @@ struct listener *create_bound_listeners(void)
       new->family = iface->addr.sa.sa_family;
       new->iface = iface;
       new->next = listeners;
-      new->tftpfd = -1;
       new->tcpfd = -1;
       new->fd = -1;
       listeners = new;
@@ -663,20 +644,6 @@ struct listener *create_bound_listeners(void)
 	  if (listen(new->tcpfd, 5) == -1)
 	    die(_("failed to listen on socket: %s"), NULL, EC_BADNET);
 	}
-
-#ifdef HAVE_TFTP
-      if ((daemon->options & OPT_TFTP) && iface->addr.sa.sa_family == AF_INET && iface->dhcp_ok)
-	{
-	  short save = iface->addr.in.sin_port;
-	  iface->addr.in.sin_port = htons(TFTP_PORT);
-	  if ((new->tftpfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1 ||
-	      setsockopt(new->tftpfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1 ||
-	      !fix_fd(new->tftpfd) ||
-	      bind(new->tftpfd, &iface->addr.sa, sa_len(&iface->addr)) == -1)
-	    die(_("failed to create TFTP socket: %s"), NULL, EC_BADNET);
-	  iface->addr.in.sin_port = save;
-	}
-#endif
 #endif /* !__ANDROID */
     }
 
